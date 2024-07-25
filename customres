@@ -1,0 +1,361 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torchvision
+import torchvision.transforms as transforms
+from torch.utils.data import DataLoader, Subset
+import numpy as np
+
+
+
+# Basic Block Definition
+
+# Custom Block Definition
+class CustomBlock(nn.Module):
+    expansion = 1
+
+    def __init__(self, in_channels, out_channels, stride=1):
+        super(CustomBlock, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_channels != self.expansion * out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, self.expansion * out_channels, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(self.expansion * out_channels)
+            )
+
+        self.global_avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv3 = nn.Conv2d(out_channels * 2, out_channels, kernel_size=1)
+        self.bn3 = nn.BatchNorm2d(out_channels)
+        self.conv4 = nn.Conv2d(out_channels, 2, kernel_size=1)
+
+    def forward(self, x):
+        identity = self.shortcut(x)
+
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+
+        pooled_out = self.global_avg_pool(out)
+        pooled_identity = self.global_avg_pool(identity)
+        concatenated = torch.cat([pooled_out, pooled_identity], dim=1)
+
+        attention = self.relu(self.bn3(self.conv3(concatenated)))
+        attention = self.conv4(attention)
+        attention = torch.softmax(attention, dim=1)
+
+        out = out * attention[:, 0].unsqueeze(2).unsqueeze(3) + identity * attention[:, 1].unsqueeze(2).unsqueeze(3)
+        out = self.relu(out)
+
+        return out
+
+class Bottleneck_custom(nn.Module):
+    expansion = 4
+
+    def __init__(self, in_channels, out_channels, stride=1, downsample=None):
+        super(Bottleneck_custom, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.conv3 = nn.Conv2d(out_channels, out_channels * 4, kernel_size=1, bias=False)
+        self.bn3 = nn.BatchNorm2d(out_channels * 4)
+        self.relu = nn.ReLU(inplace=True)
+        self.downsample = downsample
+
+        # Global Average Pooling for skip path
+        self.gap = nn.AdaptiveAvgPool2d((1, 1))
+        # Convolution to compute weights
+        self.weight_conv1 = nn.Conv2d(out_channels * 4, out_channels * 4, kernel_size=(2,1), padding=(1,0), stride=(2,1))
+        self.weight_bn1 = nn.BatchNorm2d(out_channels * 4)
+        self.weight_relu = nn.ReLU(inplace=True)
+        self.weight_conv2 = nn.Conv2d(out_channels * 4, out_channels * 4, kernel_size=(2,1), padding=(1,0), stride=(2,1))
+        self.weight_softmax = nn.Softmax(dim=2)
+
+    def forward(self, x):
+        identity = x
+        if self.downsample is not None:
+            identity = self.downsample(x)
+
+        # Current path
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out = self.conv3(out)
+        out = self.bn3(out)
+        # GAP on current path
+        gap_current = self.gap(out)
+        # gap_current = torch.flatten(gap_current, 1)
+
+        # GAP on skip path
+        gap_skip = self.gap(identity)
+        # gap_skip = torch.flatten(gap_skip, 1)
+
+        # Concatenate GAP results
+        concat_gap = torch.cat((gap_current, gap_skip), dim=2)
+        # concat_gap = concat_gap.unsqueeze(-1).unsqueeze(-1)  # Make it compatible with convolution
+
+        # Compute weights
+        weights = self.weight_conv1(concat_gap)
+        weights = self.weight_bn1(weights)
+        weights = self.weight_relu(weights)
+        weights = self.weight_conv2(weights)
+        weights1, weights2 = weights[:,:,[0],:],weights[:,:,[1],:]
+        weights = self.weight_softmax(torch.cat((weights1, weights2), dim=2))
+
+        # Reshape weights to be broadcastable
+        weights1, weights2 = weights[:,:,[0],:], weights[:,:,[1],:]
+
+        # Apply weights to the features
+        out = out * weights1
+        identity = identity * weights2
+
+        # Add the paths
+        out += identity
+        out = self.relu(out)
+
+        return out
+
+
+class ResNet50(nn.Module):
+    def __init__(self, num_classes=1):
+        super(ResNet50, self).__init__()
+        self.in_channels = 64
+
+        self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+
+        self.layer1 = self._make_layer(64, 3)
+        self.layer2 = self._make_layer(128, 4, stride=2)
+        self.layer3 = self._make_layer(256, 6, stride=2)
+        self.layer4 = self._make_layer(512, 3, stride=2)
+
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(512 * 4, num_classes)
+
+    def _make_layer(self, out_channels, blocks, stride=1):
+        layers = []
+        layers.append(self._make_bottleneck_block(self.in_channels, out_channels, stride))
+        self.in_channels = out_channels * 4
+        for _ in range(1, blocks):
+            layers.append(self._make_bottleneck_block(self.in_channels, out_channels))
+        return nn.Sequential(*layers)
+
+    def _make_bottleneck_block(self, in_channels, out_channels, stride=1):
+        downsample = None
+        if stride != 1 or in_channels != out_channels * 4:
+            downsample = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels * 4, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_channels * 4),
+            )
+        return Bottleneck(in_channels, out_channels, stride, downsample)
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.fc(x)
+        return x
+
+class ResNet_custom_50(nn.Module):
+    def __init__(self, num_classes=1):
+        super(ResNet_custom_50, self).__init__()
+        self.in_channels = 64
+
+        self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+
+        self.layer1 = self._make_layer(64, 3)
+        self.layer2 = self._make_layer(128, 4, stride=2)
+        self.layer3 = self._make_layer(256, 6, stride=2)
+        self.layer4 = self._make_layer(512, 3, stride=2)
+
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(512 * 4, num_classes)
+
+    def _make_layer(self, out_channels, blocks, stride=1):
+        layers = []
+        layers.append(self._make_bottleneck_block(self.in_channels, out_channels, stride))
+        self.in_channels = out_channels * 4
+        for _ in range(1, blocks):
+            layers.append(self._make_bottleneck_block(self.in_channels, out_channels))
+        return nn.Sequential(*layers)
+
+    def _make_bottleneck_block(self, in_channels, out_channels, stride=1):
+        downsample = None
+        if stride != 1 or in_channels != out_channels * 4:
+            downsample = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels * 4, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_channels * 4),
+            )
+        return Bottleneck_custom(in_channels, out_channels, stride, downsample)
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.fc(x)
+        return x
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+
+
+class Bottleneck(nn.Module):
+    expansion = 4
+
+    def __init__(self, in_channels, out_channels, stride=1, downsample=None):
+        super(Bottleneck, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.conv3 = nn.Conv2d(out_channels, out_channels * 4, kernel_size=1, bias=False)
+        self.bn3 = nn.BatchNorm2d(out_channels * 4)
+        self.relu = nn.ReLU(inplace=True)
+        self.downsample = downsample
+
+    def forward(self, x):
+        identity = x
+        if self.downsample is not None:
+            identity = self.downsample(x)
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out = self.relu(out)
+        out = self.conv3(out)
+        out = self.bn3(out)
+        out += identity
+        out = self.relu(out)
+        return out
+# Training and Evaluation Script
+def train_and_evaluate(model, train_loader, test_loader, criterion, optimizer, num_epochs=25):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+    from tqdm import tqdm
+    for epoch in tqdm(range(num_epochs)):
+        model.train()
+        running_loss = 0.0
+        for inputs, labels in train_loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item() * inputs.size(0)
+
+        epoch_loss = running_loss / len(train_loader.dataset)
+        print(f"Epoch {epoch+1}/{num_epochs}, Loss: {epoch_loss:.4f}")
+
+    model.eval()
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for inputs, labels in test_loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            outputs = model(inputs)
+            _, predicted = torch.max(outputs, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+
+    accuracy = 100 * correct / total
+    print(f'Accuracy: {accuracy:.2f}%')
+    return accuracy
+
+# Data Preprocessing
+transform = transforms.Compose([
+    transforms.Resize(224),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+])
+
+# Load ImageNet subset
+# trainset = torchvision.datasets.ImageFolder(root='./path_to_imagenet_train', transform=transform)
+# testset = torchvision.datasets.ImageFolder(root='./path_to_imagenet_val', transform=transform)
+import torch
+import torchvision
+import torchvision.transforms as transforms
+from torch.utils.data import DataLoader
+
+# Define the transformations
+transform = transforms.Compose([
+    transforms.Resize(224),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+])
+
+# Load CIFAR-10 dataset as a proxy for ImageNet
+train_dataset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
+test_dataset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=transform)
+# trainset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
+# testset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=transform)
+
+
+# Create data loaders
+# train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, num_workers=2)
+# test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False, num_workers=2)
+# For simplicity, we'll use a subset of the dataset with 10 classes
+num_classes = 10
+print(len(train_dataset.classes))
+class_indices = np.random.choice(len(train_dataset.classes), num_classes, replace=False)
+train_subset_indices = [i for i in range(len(train_dataset)) if train_dataset.targets[i] in class_indices]
+test_subset_indices = [i for i in range(len(test_dataset)) if test_dataset.targets[i] in class_indices]
+
+train_subset = Subset(train_dataset, train_subset_indices)
+test_subset = Subset(test_dataset, test_subset_indices)
+
+train_loader = DataLoader(train_subset, batch_size=32, shuffle=True)
+test_loader = DataLoader(test_subset, batch_size=32, shuffle=False)
+
+# Train and evaluate ResNet50
+resnet50 = ResNet50(num_classes=num_classes)
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(resnet50.parameters(), lr=0.001)
+
+print("Training ResNet50...")
+resnet50_accuracy = train_and_evaluate(resnet50, train_loader, test_loader, criterion, optimizer)
+
+# Train and evaluate CustomResNet50
+custom_resnet50 = ResNet_custom_50(num_classes=num_classes)
+optimizer = optim.Adam(custom_resnet50.parameters(), lr=0.001)
+
+print("Training CustomResNet50...")
+custom_resnet50_accuracy = train_and_evaluate(custom_resnet50, train_loader, test_loader, criterion, optimizer)
+
+print(f"ResNet50 Accuracy: {resnet50_accuracy:.2f}%")
+print(f"CustomResNet50 Accuracy: {custom_resnet50_accuracy:.2f}%")
